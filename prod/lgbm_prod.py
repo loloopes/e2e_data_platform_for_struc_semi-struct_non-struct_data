@@ -381,7 +381,12 @@ def _kafka_consumer_worker() -> None:
         }
     )
     consumer.subscribe([KAFKA_CONSUMER_TOPIC])
-    print(f"Kafka consumer started for topic={KAFKA_CONSUMER_TOPIC}", flush=True)
+    print(
+        "Kafka consumer started "
+        f"for topic={KAFKA_CONSUMER_TOPIC} "
+        f"sync_lakehouse_write={KAFKA_CONSUMER_SYNC_LAKEHOUSE_WRITE}",
+        flush=True,
+    )
     pending_msgs = []
     pending_payloads: list[dict[str, Any]] = []
     pending_request_ids: list[Optional[str]] = []
@@ -540,12 +545,19 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
     model_stage = _empty_to_none(MLFLOW_MODEL_STAGE) or ""
     rows = []
     for event in events:
+        probability_value = event.get("response_payload", {}).get("probability")
+        try:
+            probability = float(probability_value) if probability_value is not None else None
+        except (TypeError, ValueError):
+            probability = None
         rows.append(
             {
                 "event_id": event["request_id"],
                 "event_ts": event["event_ts"],
                 "model_name": model_name,
                 "model_stage": model_stage,
+                "probability": probability,
+                "client_id": str(event.get("request_payload", {}).get("id_cliente", "")),
                 "request_json": json.dumps(event["request_payload"], ensure_ascii=False),
                 "response_json": json.dumps(event["response_payload"], ensure_ascii=False),
             }
@@ -560,7 +572,29 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
         table_name = f"{PREDICTION_LOG_DATABASE}.{PREDICTION_LOG_TABLE}"
         # Write through Spark (Iceberg HMS catalog) to persist in lakehouse.
         full_table_name = f"{ICEBERG_HMS_CATALOG}.{table_name}"
+        try:
+            spark.sql(
+                f"ALTER TABLE {full_table_name} "
+                "ADD COLUMN IF NOT EXISTS probability DOUBLE"
+            )
+            spark.sql(
+                f"ALTER TABLE {full_table_name} "
+                "ADD COLUMN IF NOT EXISTS client_id STRING"
+            )
+        except Exception:
+            # Table may not exist yet; fallback CREATE TABLE path below handles it.
+            pass
         event_df = spark.createDataFrame(rows)
+        event_df = event_df.select(
+            "event_id",
+            "event_ts",
+            "model_name",
+            "model_stage",
+            "client_id",
+            "probability",
+            "request_json",
+            "response_json",
+        )
         if LAKEHOUSE_WRITE_REPARTITION > 0 and len(rows) > 1:
             event_df = event_df.repartition(LAKEHOUSE_WRITE_REPARTITION)
         writer = (
@@ -584,6 +618,8 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
                 "event_ts STRING, "
                 "model_name STRING, "
                 "model_stage STRING, "
+                "client_id STRING, "
+                "probability DOUBLE, "
                 "request_json STRING, "
                 "response_json STRING"
                 ") USING iceberg"
